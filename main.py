@@ -63,6 +63,7 @@ ASPECT_RATIO_HEIGHT = int(os.getenv("ASPECT_RATIO_HEIGHT", "16"))
 
 # --- Groq API ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 # --- Subtitles ---
 SUBTITLE_FONT = "Montserrat Extra Bold"
@@ -344,35 +345,31 @@ def get_viral_title(transcript_text, groq_api_key):
         'Content-Type': 'application/json',
     }
     data = {
-        "model": "llama-3.1-8b-instant",
+        "model": GROQ_MODEL,
         "messages": [
             {"role": "user", "content": prompt}
         ],
-        "max_tokens": 30,
+        # Reasoning tokens count against this budget; a small cap returns empty content
+        "max_completion_tokens": 300,
+        "reasoning_effort": "low",
+        "include_reasoning": False,
         "temperature": 0.7,
         "top_p": 0.9
     }
-    try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=data
-        )
-        response.raise_for_status()
-        result = response.json()
-        # Just return the first line of the response as the title, and filter out any lines that look like explanations or quotes
-        content = result['choices'][0]['message']['content']
-        lines = [l.strip('"') for l in content.strip().split('\n') if l.strip() and not l.lower().startswith('here') and not l.lower().startswith('title:')]
-        title = lines[0] if lines else "Untitled Clip"
-        return title
-    except requests.exceptions.HTTPError as e:
-        print(f"Error with Groq API: {e}")
-        print(f"Response status code: {response.status_code}")
-        print(f"Response text: {response.text}")
-        return "Untitled Clip"
-    except Exception as e:
-        print(f"Unexpected error with Groq API: {e}")
-        return "Untitled Clip"
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json=data,
+        timeout=60
+    )
+    if not response.ok:
+        raise RuntimeError(f"Groq API error {response.status_code}: {response.text}")
+    content = response.json()['choices'][0]['message']['content'] or ""
+    # Keep the first line, skipping lines that look like explanations or labels
+    lines = [l.strip('"') for l in content.strip().split('\n') if l.strip() and not l.lower().startswith('here') and not l.lower().startswith('title:')]
+    if not lines:
+        raise RuntimeError(f"Groq returned no title for model {GROQ_MODEL}")
+    return lines[0]
 
 def calculate_engagement_score(clip, transcription):
     """
