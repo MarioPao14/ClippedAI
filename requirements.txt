@@ -1,8 +1,15 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 clipsai
-whisperx@git+https://github.com/m-bain/whisperx.git
+whisperx==3.3.1
+torch==2.2.2
+torchaudio==2.2.2
+torchvision==0.17.2
+transformers>=4.40,<4.50
+sentence-transformers<4
+yt-dlp
 python-magic
 protobuf>=4.25.3,<5
 python-dotenv
 customtkinter
 scipy>=1.10.0
-numpy>=1.24.0
+numpy>=1.24.0,<2

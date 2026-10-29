@@ -2,9 +2,11 @@
 
 import os
 import pickle
+import shutil
 import subprocess
 import sys
 import string
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -408,96 +410,38 @@ def calculate_engagement_score(clip, transcription):
     
     return engagement_score
 
-# Find all mp4 files in the input directory
-input_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('.mp4')]
-if not input_files:
-    raise FileNotFoundError('No mp4 file found in input directory.')
+@dataclass(frozen=True)
+class VideoJob:
+    input_path: str
+    transcription_path: str
+    max_clips: int
+    output_dir: str
 
-# Find all transcription files in the input directory
-transcription_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('_transcription.pkl')]
 
-# If more than one mp4, ask user to match transcription files (if any)
-video_transcription_map = {}
-if len(input_files) > 1:
-    print("Multiple video files detected:")
-    for idx, f in enumerate(input_files, 1):
-        print(f"  {idx}) {f}")
-    print("\nAvailable transcription files:")
-    for idx, f in enumerate(transcription_files, 1):
-        print(f"  {idx}) {f}")
-    print("\nFor each video, enter the number of the matching transcription file, or 0 to transcribe from scratch.")
-    for vid_idx, video_file in enumerate(input_files, 1):
-        while True:
-            try:
-                match = input(f"Match transcription for '{video_file}' (0 for none): ").strip().replace('\n', '')
-                match_idx = int(match)
-                if match_idx == 0:
-                    video_transcription_map[video_file] = None
-                    break
-                elif 1 <= match_idx <= len(transcription_files):
-                    video_transcription_map[video_file] = transcription_files[match_idx-1]
-                    break
-                else:
-                    print("Invalid choice. Try again.")
-            except Exception:
-                print("Invalid input. Try again.")
-else:
-    # Only one video, try to auto-match
-    video_file = input_files[0]
-    base_name = os.path.splitext(os.path.basename(video_file))[0]
-    expected_trans = f"{base_name}_transcription.pkl"
-    if expected_trans in transcription_files:
-        video_transcription_map[video_file] = expected_trans
-    else:
-        video_transcription_map[video_file] = None
+@dataclass(frozen=True)
+class ClipResult:
+    file: str
+    title: str
+    start: float
+    end: float
+    duration: float
 
-# Prompt user for number of clips for each video BEFORE any processing
-video_max_clips = {}
-clip_ranges = [(1,2), (3,4), (5,6), (7,8), (9,10), (11,12)]
-for video_file in video_transcription_map:
-    print(f"\nHow many clips do you want for '{video_file}'?")
-    for i, (low, high) in enumerate(clip_ranges, 1):
-        print(f"  {i}) {low}-{high}")
-    try:
-        user_choice = int(input("Your choice: ").strip().replace('\n', ''))
-        if not (1 <= user_choice <= len(clip_ranges)):
-            raise ValueError
-    except Exception:
-        print("Invalid input. Defaulting to 2 clips.")
-        user_choice = 1
-    max_clips = clip_ranges[user_choice-1][1]
-    print(f"Will select up to {max_clips} clips (if available and engaging).\n")
-    video_max_clips[video_file] = max_clips
 
-# Process each video file
-for video_idx, (video_file, transcription_file) in enumerate(video_transcription_map.items(), 1):
-    print(f"\n=== Processing Video {video_idx}/{len(video_transcription_map)}: {video_file} ===")
-    input_path = os.path.abspath(os.path.join(INPUT_DIR, video_file))
-    transcription_path = os.path.join(INPUT_DIR, transcription_file) if transcription_file else get_transcription_file_path(input_path)
-    max_clips = video_max_clips[video_file]
-
-    # 1. Transcribe the video (or load existing)
-    transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
-    transcription = load_existing_transcription(transcription_path) if transcription_file else None
+def load_or_transcribe(input_path: str, transcription_path: str):
+    transcription = load_existing_transcription(transcription_path)
     if transcription is None:
+        transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
         transcription = transcribe_with_progress(input_path, transcriber)
         save_transcription(transcription, transcription_path)
+    return transcription
 
-    # 2. Find clips
-    clipfinder = ClipFinder()
-    clips = clipfinder.find_clips(transcription=transcription)
-    if not clips:
-        print('No clips found in the video.')
-        continue
 
-    # 3. Filter clips by duration and select the best ones
+def select_clips(clips, transcription, max_clips: int) -> list:
     valid_clips = [c for c in clips if MIN_CLIP_DURATION <= (c.end_time - c.start_time) <= MAX_CLIP_DURATION]
     selected_clips = []
 
     if valid_clips:
-        # Calculate engagement scores for all valid clips
         clip_scores = [(clip, calculate_engagement_score(clip, transcription)) for clip in valid_clips]
-        # Sort by engagement score (highest first)
         clip_scores.sort(key=lambda x: x[1], reverse=True)
         # Select up to max_clips, but only include clips with engagement >= 0.6 (for 3rd and beyond)
         for i, (clip, score) in enumerate(clip_scores):
@@ -511,93 +455,169 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
             score = calculate_engagement_score(clip, transcription)
             print(f'  Clip {i+1}: {clip.start_time:.1f}s - {clip.end_time:.1f}s (duration: {clip.end_time - clip.start_time:.1f}s, engagement: {score:.3f})')
         print(f'Clip selection criteria: Top engaging clips within {MIN_CLIP_DURATION}-{MAX_CLIP_DURATION} second range')
+        return selected_clips
+
+    print(f'No clips found between {MIN_CLIP_DURATION} and {MAX_CLIP_DURATION} seconds.')
+    short_clips = [c for c in clips if c.end_time - c.start_time < MIN_CLIP_DURATION]
+    if short_clips:
+        print('Attempting to extend most engaging short clips to minimum duration...')
+        short_clip_scores = [(clip, calculate_engagement_score(clip, transcription)) for clip in short_clips]
+        short_clip_scores.sort(key=lambda x: x[1], reverse=True)
+        for i, (clip, score) in enumerate(short_clip_scores[:2]):
+            extension_needed = MIN_CLIP_DURATION - (clip.end_time - clip.start_time)
+            max_extension = min(extension_needed, MAX_CLIP_DURATION - (clip.end_time - clip.start_time))
+            extended_clip = Clip(
+                start_time=clip.start_time,
+                end_time=clip.end_time + max_extension,
+                start_char=clip.start_char,
+                end_char=clip.end_char
+            )
+            selected_clips.append(extended_clip)
+            print(f'Extended clip {i+1}: {extended_clip.start_time:.1f}s - {extended_clip.end_time:.1f}s (duration: {extended_clip.end_time - extended_clip.start_time:.1f}s)')
     else:
-        print(f'No clips found between {MIN_CLIP_DURATION} and {MAX_CLIP_DURATION} seconds.')
-        # Find clips that are too short and try to extend them
-        short_clips = [c for c in clips if c.end_time - c.start_time < MIN_CLIP_DURATION]
-        if short_clips:
-            print('Attempting to extend most engaging short clips to minimum duration...')
-            short_clip_scores = [(clip, calculate_engagement_score(clip, transcription)) for clip in short_clips]
-            short_clip_scores.sort(key=lambda x: x[1], reverse=True)
-            # Take top 2 short clips and extend them
-            for i, (clip, score) in enumerate(short_clip_scores[:2]):
-                if clip.end_time - clip.start_time < MIN_CLIP_DURATION:
-                    extension_needed = MIN_CLIP_DURATION - (clip.end_time - clip.start_time)
-                    max_extension = min(extension_needed, MAX_CLIP_DURATION - (clip.end_time - clip.start_time))
-                    extended_clip = Clip(
-                        start_time=clip.start_time,
-                        end_time=clip.end_time + max_extension,
-                        start_char=clip.start_char,
-                        end_char=clip.end_char
-                    )
-                    selected_clips.append(extended_clip)
-                    print(f'Extended clip {i+1}: {extended_clip.start_time:.1f}s - {extended_clip.end_time:.1f}s (duration: {extended_clip.end_time - extended_clip.start_time:.1f}s)')
-        else:
-            # All clips are too long, trim the most engaging ones
-            print('All clips are too long. Trimming most engaging clips to maximum duration...')
-            long_clip_scores = [(clip, calculate_engagement_score(clip, transcription)) for clip in clips]
-            long_clip_scores.sort(key=lambda x: x[1], reverse=True)
-            # Take top 2 long clips and trim them
-            for i, (clip, score) in enumerate(long_clip_scores[:2]):
-                if clip.end_time - clip.start_time > MAX_CLIP_DURATION:
-                    trimmed_clip = Clip(
-                        start_time=clip.start_time,
-                        end_time=clip.start_time + MAX_CLIP_DURATION,
-                        start_char=clip.start_char,
-                        end_char=clip.end_char
-                    )
-                    selected_clips.append(trimmed_clip)
-                    print(f'Trimmed clip {i+1}: {trimmed_clip.start_time:.1f}s - {trimmed_clip.end_time:.1f}s (duration: {trimmed_clip.end_time - trimmed_clip.start_time:.1f}s)')
+        print('All clips are too long. Trimming most engaging clips to maximum duration...')
+        long_clip_scores = [(clip, calculate_engagement_score(clip, transcription)) for clip in clips]
+        long_clip_scores.sort(key=lambda x: x[1], reverse=True)
+        for i, (clip, score) in enumerate(long_clip_scores[:2]):
+            if clip.end_time - clip.start_time <= MAX_CLIP_DURATION:
+                continue
+            trimmed_clip = Clip(
+                start_time=clip.start_time,
+                end_time=clip.start_time + MAX_CLIP_DURATION,
+                start_char=clip.start_char,
+                end_char=clip.end_char
+            )
+            selected_clips.append(trimmed_clip)
+            print(f'Trimmed clip {i+1}: {trimmed_clip.start_time:.1f}s - {trimmed_clip.end_time:.1f}s (duration: {trimmed_clip.end_time - trimmed_clip.start_time:.1f}s)')
+    return selected_clips[:max_clips]
 
-    # Process each selected clip
-    for clip_index, clip in enumerate(selected_clips):
-        print(f'\n--- Processing Clip {clip_index + 1}/{len(selected_clips)} ---')
-        # 4. Trim the video to the selected clip
-        media_editor = MediaEditor()
-        media_file = AudioVideoFile(input_path)
-        trimmed_path = os.path.join(OUTPUT_DIR, f'trimmed_clip_{clip_index + 1}.mp4')
-        print('Trimming video to selected clip...')
-        trimmed_media_file = media_editor.trim(
-            media_file=media_file,
-            start_time=clip.start_time,
-            end_time=clip.end_time,
-            trimmed_media_file_path=trimmed_path
-        )
-        # 5. Try to resize to 9:16 aspect ratio
-        output_path = os.path.join(OUTPUT_DIR, f'yt_short_{clip_index + 1}.mp4')
+
+def resize_to_short(media_editor, trimmed_path: str, output_path: str) -> None:
+    crops = resize(
+        video_file_path=trimmed_path,
+        pyannote_auth_token=HUGGINGFACE_TOKEN,
+        aspect_ratio=(ASPECT_RATIO_WIDTH, ASPECT_RATIO_HEIGHT)
+    )
+    media_editor.resize_video(
+        original_video_file=AudioVideoFile(trimmed_path),
+        resized_video_file_path=output_path,
+        width=crops.crop_width,
+        height=crops.crop_height,
+        segments=crops.to_dict()["segments"],
+    )
+
+
+def render_clip(job: VideoJob, transcription, clip, clip_number: int) -> ClipResult:
+    print(f'\n--- Processing Clip {clip_number} ---')
+    media_editor = MediaEditor()
+    trimmed_path = os.path.join(job.output_dir, f'trimmed_clip_{clip_number}.mp4')
+    short_path = os.path.join(job.output_dir, f'yt_short_{clip_number}.mp4')
+    print('Trimming video to selected clip...')
+    media_editor.trim(
+        media_file=AudioVideoFile(job.input_path),
+        start_time=clip.start_time,
+        end_time=clip.end_time,
+        trimmed_media_file_path=trimmed_path
+    )
+    print('Resizing video to 9:16 aspect ratio...')
+    resize_to_short(media_editor, trimmed_path, short_path)
+    subtitled_path = create_animated_subtitles(short_path, transcription, clip, short_path)
+
+    clip_text = " ".join([w["word"] for w in transcription.get_word_info() if w["start_time"] >= clip.start_time and w["end_time"] <= clip.end_time])
+    title = get_viral_title(clip_text, GROQ_API_KEY)
+    print(f"\nViral Title for Clip {clip_number}: {title}")
+
+    final_path = os.path.join(job.output_dir, f"{clip_number:02d} {safe_filename(title).strip()}.mp4")
+    shutil.move(subtitled_path, final_path)
+    for intermediate in (trimmed_path, short_path):
+        if os.path.exists(intermediate):
+            os.remove(intermediate)
+    print(f"Final video saved as: {final_path}\n")
+    return ClipResult(
+        file=os.path.basename(final_path),
+        title=title,
+        start=round(clip.start_time, 3),
+        end=round(clip.end_time, 3),
+        duration=round(clip.end_time - clip.start_time, 3),
+    )
+
+
+def process_video(job: VideoJob) -> List[ClipResult]:
+    os.makedirs(job.output_dir, exist_ok=True)
+    transcription = load_or_transcribe(job.input_path, job.transcription_path)
+    clips = ClipFinder().find_clips(transcription=transcription)
+    if not clips:
+        print('No clips found in the video.')
+        return []
+    selected_clips = select_clips(clips, transcription, job.max_clips)
+    return [render_clip(job, transcription, clip, number) for number, clip in enumerate(selected_clips, 1)]
+
+
+def run_interactive() -> None:
+    input_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('.mp4')]
+    if not input_files:
+        raise FileNotFoundError('No mp4 file found in input directory.')
+
+    transcription_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('_transcription.pkl')]
+
+    # If more than one mp4, ask user to match transcription files (if any)
+    video_transcription_map = {}
+    if len(input_files) > 1:
+        print("Multiple video files detected:")
+        for idx, f in enumerate(input_files, 1):
+            print(f"  {idx}) {f}")
+        print("\nAvailable transcription files:")
+        for idx, f in enumerate(transcription_files, 1):
+            print(f"  {idx}) {f}")
+        print("\nFor each video, enter the number of the matching transcription file, or 0 to transcribe from scratch.")
+        for video_file in input_files:
+            while True:
+                try:
+                    match = input(f"Match transcription for '{video_file}' (0 for none): ").strip().replace('\n', '')
+                    match_idx = int(match)
+                    if match_idx == 0:
+                        video_transcription_map[video_file] = None
+                        break
+                    elif 1 <= match_idx <= len(transcription_files):
+                        video_transcription_map[video_file] = transcription_files[match_idx-1]
+                        break
+                    else:
+                        print("Invalid choice. Try again.")
+                except Exception:
+                    print("Invalid input. Try again.")
+    else:
+        video_file = input_files[0]
+        expected_trans = f"{os.path.splitext(video_file)[0]}_transcription.pkl"
+        video_transcription_map[video_file] = expected_trans if expected_trans in transcription_files else None
+
+    # Prompt user for number of clips for each video BEFORE any processing
+    video_max_clips = {}
+    clip_ranges = [(1,2), (3,4), (5,6), (7,8), (9,10), (11,12)]
+    for video_file in video_transcription_map:
+        print(f"\nHow many clips do you want for '{video_file}'?")
+        for i, (low, high) in enumerate(clip_ranges, 1):
+            print(f"  {i}) {low}-{high}")
         try:
-            print('Resizing video to 9:16 aspect ratio...')
-            aspect_ratio_width = int(os.getenv('ASPECT_RATIO_WIDTH', '9'))
-            aspect_ratio_height = int(os.getenv('ASPECT_RATIO_HEIGHT', '16'))
-            crops = resize(
-                video_file_path=trimmed_path,
-                pyannote_auth_token=HUGGINGFACE_TOKEN,
-                aspect_ratio=(aspect_ratio_width, aspect_ratio_height)
-            )
-            resized_video_file = media_editor.resize_video(
-                original_video_file=AudioVideoFile(trimmed_path),
-                resized_video_file_path=output_path,
-                width=crops.crop_width,
-                height=crops.crop_height,
-                segments=crops.to_dict()["segments"],
-            )
-            print(f'YouTube Short (9:16) saved to {output_path}')
-        except Exception as e:
-            print(f'Resizing failed: {e}')
-            print('Saving trimmed clip without resizing...')
-            output_path = trimmed_path
-        # 6. Add styled subtitles
-        final_output = create_animated_subtitles(output_path, transcription, clip, output_path)
-        # 7. Generate viral title using Groq API
-        clip_text = " ".join([w["word"] for w in transcription.get_word_info() if w["start_time"] >= clip.start_time and w["end_time"] <= clip.end_time])
-        groq_api_key = os.getenv('GROQ_API_KEY', 'your_groq_api_key_here')
-        title = get_viral_title(clip_text, groq_api_key)
-        print(f"\nViral Title for Clip {clip_index + 1}: {title}")
-        # 8. Save the final video with the viral title (keep spaces, punctuation, and emojis)
-        import shutil
-        viral_filename = safe_filename(title).strip() + ".mp4"
-        viral_path = os.path.join(OUTPUT_DIR, viral_filename)
-        shutil.copy(final_output, viral_path)
-        print(f"Final video saved as: {viral_path}\n")
+            user_choice = int(input("Your choice: ").strip().replace('\n', ''))
+            if not (1 <= user_choice <= len(clip_ranges)):
+                raise ValueError
+        except Exception:
+            print("Invalid input. Defaulting to 2 clips.")
+            user_choice = 1
+        max_clips = clip_ranges[user_choice-1][1]
+        print(f"Will select up to {max_clips} clips (if available and engaging).\n")
+        video_max_clips[video_file] = max_clips
 
-print(f"\nSuccessfully created YouTube Shorts for {len(video_transcription_map)} video(s)!")
+    for video_idx, (video_file, transcription_file) in enumerate(video_transcription_map.items(), 1):
+        print(f"\n=== Processing Video {video_idx}/{len(video_transcription_map)}: {video_file} ===")
+        input_path = os.path.abspath(os.path.join(INPUT_DIR, video_file))
+        # Choosing 0 forces a fresh transcription, as in the original flow
+        transcription_path = (os.path.join(INPUT_DIR, transcription_file) if transcription_file
+                              else get_transcription_file_path(input_path))
+        if not transcription_file and os.path.exists(transcription_path):
+            os.remove(transcription_path)
+        process_video(VideoJob(input_path, transcription_path, video_max_clips[video_file], OUTPUT_DIR))
+
+
+if __name__ == "__main__":
+    run_interactive()
