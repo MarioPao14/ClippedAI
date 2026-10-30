@@ -15,3 +15,5 @@ python-dotenv
 customtkinter
 scipy>=1.10.0
 numpy>=1.24.0,<2
+ultralytics==8.4.193
+gdown==6.5.1
