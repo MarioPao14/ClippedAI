@@ -66,7 +66,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 # --- Subtitles ---
-SUBTITLE_FONT = "Montserrat Extra Bold"
+SUBTITLE_FONT = "Lilita One"
 SUBTITLE_FONT_SIZE = 80
 SUBTITLE_ALIGNMENT = 8  # Top center
 SUBTITLE_MARGIN_V = 120
@@ -215,7 +215,7 @@ def transcribe_with_progress(audio_file_path, transcriber):
 
 def create_animated_subtitles(video_path, transcription, clip, output_path):
     """
-    Create clean, bold subtitles matching the provided style: white bold for text, yellow bold for numbers/currency, no effects, TOP CENTER.
+    Create bold uppercase subtitles: yellow text with black outline, lower third.
     """
     print('Creating styled subtitles...')
     
@@ -225,7 +225,7 @@ def create_animated_subtitles(video_path, transcription, clip, output_path):
         print('No word-level transcript found for the clip. Skipping subtitles.')
         return video_path
     
-    # Build cues: group words into phrases of max 25 chars
+    # Build cues: group words into phrases of max 14 chars
     cues = []
     current_cue = {
         'words': [],
@@ -241,7 +241,7 @@ def create_animated_subtitles(video_path, transcription, clip, output_path):
         should_start_new = False
         if current_cue['start_time'] is None:
             should_start_new = True
-        elif len(' '.join(current_cue['words']) + ' ' + word) > 25:
+        elif len(' '.join(current_cue['words']) + ' ' + word) > 14:
             should_start_new = True
         elif start_time - current_cue['end_time'] > 0.5:
             should_start_new = True
@@ -268,15 +268,12 @@ def create_animated_subtitles(video_path, transcription, clip, output_path):
             'text': ' '.join(current_cue['words'])
         })
     
-    # Determine font used and print to console
-    font_used = "Montserrat Extra Bold"
-    print(f"Subtitles will use font: {font_used}")
-    print("NOTE: Ensure 'Montserrat Extra Bold' font is installed or is available in the fonts directory.")
+    print(f"Subtitles will use font: {SUBTITLE_FONT}")
 
-    # Write ASS subtitle file with clean, bold styling at the TOP CENTER
+    # Write ASS subtitle file: bottom center, raised above the TikTok/Reels UI
     ass_file = os.path.join(OUTPUT_DIR, 'temp_subtitles.ass')
     with open(ass_file, 'w', encoding='utf-8') as f:
-        f.write("""[Script Info]
+        f.write(f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -285,12 +282,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Montserrat Extra Bold,80,&H00FFFFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Yellow,Montserrat Extra Bold,80,&H0000FFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Fallback,Arial Rounded MT Bold,80,&H00FFFFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: FallbackYellow,Arial Rounded MT Bold,80,&H0000FFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Fallback2,Arial Black,80,&H00FFFFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Fallback2Yellow,Arial Black,80,&H0000FFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
+Style: Default,{SUBTITLE_FONT},130,&H0000E6FF,&H000000FF,&H00000000,&HFF000000,0,0,0,0,100,100,2,0,1,12,0,2,30,30,640,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -298,20 +290,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for cue in cues:
             start = ass_time(cue['start'])
             end = ass_time(cue['end'])
-            words = cue['text'].split()
-            line = ''
-            for w in words:
-                if any(char.isdigit() for char in w) or '$' in w or (',' in w and w.replace(',', '').isdigit()):
-                    line += f'{{\\style Yellow}}{w} '
-                else:
-                    line += f'{w} '
-            line = line.strip()
-            f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{line}\n")
+            f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{cue['text'].upper()}\n")
     
     final_output = output_path.replace('.mp4', '_with_subtitles.mp4')
     ffmpeg_cmd = [
         'ffmpeg', '-i', video_path,
-        '-vf', f"ass={ass_file}",
+        # Without fontsdir libass only sees system fonts and silently falls back to a default one
+        '-vf', f"ass={ass_file}:fontsdir={FONT_DIR}",
         '-c:a', 'copy',
         '-y',
         final_output
